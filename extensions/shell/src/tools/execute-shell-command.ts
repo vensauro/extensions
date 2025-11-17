@@ -3,6 +3,7 @@ import { AI } from "@raycast/api";
 import { exec } from "child_process";
 import { promisify } from "util";
 import { getCachedEnv } from "..";
+import { buildExecCommand } from "../utils/platform";
 
 type Input = {
   /**
@@ -15,7 +16,8 @@ const execAsync = promisify(exec);
 
 export default async function (input: Input) {
   const execEnv = await getCachedEnv();
-  return execAsync(input.command, execEnv);
+  const cmd = buildExecCommand(input.command, execEnv.shell);
+  return execAsync(cmd, { env: execEnv.env, cwd: execEnv.cwd });
 }
 
 export const confirmation = async (input: Input) => {

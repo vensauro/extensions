@@ -14,9 +14,9 @@ import {
 } from "@raycast/api";
 import { shellHistory } from "shell-history";
 import { shellEnv } from "shell-env";
-import { ChildProcess, exec } from "child_process";
-import { runAppleScript } from "run-applescript";
-import { usePersistentState } from "raycast-toolkit";
+import { ChildProcess, exec, execSync } from "child_process";
+import { runPowerShellScript, runAppleScript, useLocalStorage } from "@raycast/utils";
+import { isWin, isMac, buildExecCommand, getHomeDir } from "./utils/platform";
 import fs from "fs";
 
 export interface EnvType {
@@ -39,14 +39,21 @@ export const getCachedEnv = async () => {
   if (cachedEnv) {
     return cachedEnv;
   }
-
-  const env = await shellEnv();
-
-  cachedEnv = {
-    env: env,
-    cwd: env.HOME || `/Users/${process.env.USER}`,
-    shell: env.SHELL,
-  };
+  if (isWin) {
+    const env = process.env as Record<string, string>;
+    cachedEnv = {
+      env: env,
+      cwd: env.USERPROFILE || getHomeDir(),
+      shell: env.ComSpec || "powershell.exe",
+    };
+  } else {
+    const env = await shellEnv();
+    cachedEnv = {
+      env: env,
+      cwd: env.HOME || `/Users/${process.env.USER}`,
+      shell: env.SHELL,
+    };
+  }
   return cachedEnv;
 };
 
@@ -60,42 +67,33 @@ const Result = ({ cmd }: { cmd: string }) => {
 
     const runCommand = async () => {
       const execEnv = await getCachedEnv();
-      child = exec(`$SHELL -i -c "${cmd}"`, execEnv);
-      child.stderr?.on("data", (data: string) => {
-        if (killed) {
-          return;
+      const runCmd = buildExecCommand(cmd, execEnv.shell, true);
+      // Use exec with callback to capture full stdout/stderr once finished.
+      child = exec(runCmd, { env: execEnv.env, cwd: execEnv.cwd }, (error, stdout, stderr) => {
+        if (killed) return;
+        const combined = `${stdout || ""}${stderr || ""}`;
+        if (error) {
+          setOutput((prev) => prev + combined);
+          showToast({ style: Toast.Style.Failure, title: "Error executing command" });
+        } else {
+          setOutput((prev) => prev + combined);
+          showToast({ style: Toast.Style.Success, title: "Command execution complete" });
         }
-        setOutput(data);
-        showToast({
-          style: Toast.Style.Failure,
-          title: "Error executing command",
-        });
-        return;
-      });
-      child.stdout?.on("data", (data: string) => {
-        if (killed) {
-          return;
-        }
-        showToast({
-          style: Toast.Style.Animated,
-          title: "Executing command...",
-        });
-        setOutput(data);
-      });
-      child.on("exit", () => {
-        showToast({
-          style: Toast.Style.Success,
-          title: "Command execution complete",
-        });
         setFinished(true);
       });
+      // show an executing toast while the command runs
+      showToast({ style: Toast.Style.Animated, title: "Executing command..." });
     };
     runCommand();
 
     return function cleanup() {
       killed = true;
       if (child !== null) {
-        child.kill("SIGTERM");
+        try {
+          child.kill();
+        } catch {
+          // best-effort; on Windows signals differ
+        }
       }
     };
   }, [cmd, setOutput, setFinished]);
@@ -357,31 +355,70 @@ const runInGhostty = (command: string) => {
 };
 
 const runInTerminal = (command: string) => {
-  const script = `
-  tell application "Terminal"
-    do script "${command.replaceAll('"', '\\"')}"
-    activate
-  end tell
-  `;
+  if (isMac) {
+    const script = `
+    tell application "Terminal"
+      do script "${command.replaceAll('"', '\\"')}"
+      activate
+    end tell
+    `;
+    runAppleScript(script);
+    return;
+  }
 
-  runAppleScript(script);
+  if (isWin) {
+    const escaped = command.replaceAll('"', '\\"');
+    try {
+      execSync(`wt -w 0 nt powershell -NoExit -Command "${escaped}"`);
+      return;
+    } catch {
+      // fallback to start
+      exec(`start powershell -NoExit -Command "${escaped}"`);
+      return;
+    }
+  }
+
+  // Fallback: spawn a shell directly
+  const fallback = buildExecCommand(command);
+  exec(fallback);
 };
 
 export default function Command(props: { arguments?: ShellArguments }) {
   const [cmd, setCmd] = useState<string>("");
   const [history, setHistory] = useState<string[]>();
-  const [recentlyUsed, setRecentlyUsed] = usePersistentState<string[]>("recently-used", []);
-  const iTermInstalled = fs.existsSync("/Applications/iTerm.app");
-  const kittyInstalled = fs.existsSync("/Applications/kitty.app");
-  const WarpInstalled = fs.existsSync("/Applications/Warp.app");
-  const GhosttyInstalled = fs.existsSync("/Applications/Ghostty.app");
+  const { value: recentlyUsed = [], setValue: setRecentlyUsed } = useLocalStorage<string[]>("recently-used", []);
+  const iTermInstalled = isMac && fs.existsSync("/Applications/iTerm.app");
+  const kittyInstalled = isMac && fs.existsSync("/Applications/kitty.app");
+  const WarpInstalled = isMac && fs.existsSync("/Applications/Warp.app");
+  const GhosttyInstalled = isMac && fs.existsSync("/Applications/Ghostty.app");
+  const windowsTerminalInstalled = isWin && (() => {
+    try {
+      execSync("where wt");
+      return true;
+    } catch {
+      return false;
+    }
+  })();
 
   const addToRecentlyUsed = (command: string) => {
-    setRecentlyUsed((list) => (list.find((x) => x === command) ? list : [command, ...list].slice(0, 10)));
+    setRecentlyUsed(recentlyUsed.find((x) => x === command) ? recentlyUsed : [command, ...recentlyUsed].slice(0, 10));
   };
 
   useEffect(() => {
-    setHistory([...new Set(shellHistory().reverse())] as string[]);
+    const load = async () => {
+      try {
+        if (isWin) {
+          // Try to read PSReadLine history via PowerShell
+          const out = await runPowerShellScript('Get-Content (Get-PSReadlineOption).HistorySavePath | Select-Object -Last 1000');
+          setHistory([...new Set(out.split(/\r?\n/).reverse())] as string[]);
+        } else {
+          setHistory([...new Set(shellHistory().reverse())] as string[]);
+        }
+      } catch {
+        setHistory([]);
+      }
+    };
+    load();
   }, [setHistory]);
 
   const { arguments_terminal_type: terminalType, arguments_terminal: openInTerminal } =
@@ -515,6 +552,18 @@ export default function Command(props: { arguments?: ShellArguments }) {
                         popToRoot();
                         addToRecentlyUsed(command);
                         runInWarp(command);
+                      }}
+                    />
+                  ) : null}
+                  {isWin && windowsTerminalInstalled ? (
+                    <Action
+                      title="Execute in Windows Terminal"
+                      icon={Icon.Terminal}
+                      onAction={() => {
+                        closeMainWindow();
+                        popToRoot();
+                        addToRecentlyUsed(command);
+                        runInTerminal(command);
                       }}
                     />
                   ) : null}
